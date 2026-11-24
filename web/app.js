@@ -1,5 +1,5 @@
 const $ = (selector) => document.querySelector(selector);
-const labels = {queued: '排队中', running: '生成中', awaiting_upload: '等待上传 GIF', completed: '已完成', failed: '失败'};
+const labels = {queued: '排队中', running: '生成中', completed: '已完成', failed: '失败'};
 let token = sessionStorage.getItem('bridge-token') || '';
 let lastSnapshot = '';
 let previewUrls = [];
@@ -41,11 +41,18 @@ function disconnect() {
   lastSnapshot = '';
 }
 
-function updateModeHint() {
-  const api = document.querySelector('input[name=backend]:checked').value === 'api';
-  $('#mode-hint').textContent = api
-    ? '使用官方 Images API 自动生成，消耗 API 项目额度。'
-    : '网页模式需要你在 ChatGPT 中提交提示词、下载并上传 GIF。';
+function showSession(session) {
+  const names = {starting:'启动中', ready:'已登录', busy:'生成中', login_required:'未登录', opening_login:'打开登录窗口', signing_in:'等待登录', checking:'验证登录', error:'连接异常'};
+  $('#account-status').textContent = names[session.status] || session.status;
+  $('#account-status').className = 'status ' + (session.status === 'ready' ? 'completed' : '');
+  $('#account-login').disabled = !['ready', 'login_required', 'error'].includes(session.status);
+  $('#account-finish').hidden = session.status !== 'signing_in';
+  $('#submit-job').disabled = !['ready', 'busy'].includes(session.status);
+  $('#account-help').textContent = session.error || (session.status === 'signing_in'
+    ? '请在浏览器窗口中登录 Plus 账号，然后点击“已完成登录”。'
+    : session.status === 'ready' || session.status === 'busy'
+      ? '登录状态已保存，任务通过无头浏览器运行。'
+      : '首次登录会打开浏览器窗口。请使用支持 GIF 的 Plus 账号。');
 }
 
 async function connect() {
@@ -56,10 +63,6 @@ async function connect() {
   $('#disconnect').hidden = false;
   $('#connection').textContent = '服务已连接';
   $('#connection').className = 'connection online';
-  $('#api-option').disabled = !health.api_enabled;
-  $('#api-note').textContent = health.api_enabled ? '自动生成 · API 项目计费' : '需在服务端配置 OPENAI_API_KEY';
-  if (!health.api_enabled) document.querySelector('input[value=web]').checked = true;
-  updateModeHint();
   lastSnapshot = '';
   await refresh();
 }
@@ -87,11 +90,11 @@ async function renderJobs(jobs) {
   $('#job-count').textContent = jobs.length;
   for (const job of jobs) {
     const card = $('#job-template').content.firstElementChild.cloneNode(true);
-    card.querySelector('.job-mode').textContent = job.backend === 'api' ? '官方 API' : 'ChatGPT 网页';
+    card.querySelector('.job-mode').textContent = 'ChatGPT · 无头浏览器';
     const status = card.querySelector('.status');
     status.textContent = labels[job.status] || job.status;
     status.classList.add(job.status);
-    card.querySelector('.job-prompt').textContent = job.prompt || 'GIF 创作';
+    card.querySelector('.job-prompt').textContent = job.prompt || 'GIF 任务';
     if (job.error) {
       const error = card.querySelector('.job-error');
       error.hidden = false;
@@ -99,38 +102,6 @@ async function renderJobs(jobs) {
     }
     const actions = card.querySelector('.job-actions');
     const path = `/v1/gif/jobs/${job.id}`;
-    if (job.status === 'awaiting_upload') {
-      addButton(actions, '复制提示词', async () => {
-        await navigator.clipboard.writeText('请生成一个可下载的原生循环 GIF。' + job.prompt);
-        notify('提示词已复制');
-      });
-      const open = document.createElement('a');
-      open.href = 'https://chatgpt.com/';
-      open.target = '_blank';
-      open.rel = 'noreferrer';
-      open.className = 'action-link secondary';
-      open.textContent = '打开 ChatGPT ↗';
-      actions.append(open);
-      const upload = document.createElement('input');
-      upload.type = 'file';
-      upload.accept = '.gif,image/gif';
-      upload.hidden = true;
-      upload.setAttribute('aria-label', '上传生成的 GIF');
-      const uploadButton = addButton(actions, '上传 GIF', async () => upload.click(), false);
-      upload.addEventListener('change', async () => {
-        const file = upload.files[0];
-        if (!file) return;
-        if (file.size > 25 * 1024 * 1024) return notify('文件需小于 25 MiB');
-        uploadButton.disabled = true;
-        try {
-          await request(path + '/result', {method: 'PUT', body: file, headers: {'Content-Type': 'image/gif'}});
-          notify('GIF 已上传');
-          await refresh();
-        } catch (error) { notify(error.message); }
-        finally { uploadButton.disabled = false; upload.value = ''; }
-      });
-      actions.append(upload);
-    }
     if (job.status === 'completed') {
       addButton(actions, '下载 GIF', async () => {
         const blob = await request(path + '/result', {}, true);
@@ -151,7 +122,7 @@ async function renderJobs(jobs) {
       }).catch((error) => notify(error.message));
     }
     if (!['queued', 'running'].includes(job.status)) {
-      addButton(actions, job.status === 'awaiting_upload' ? '取消任务' : '移除记录', async () => {
+      addButton(actions, '移除记录', async () => {
         await request(path, {method: 'DELETE'});
         await refresh();
       });
@@ -164,7 +135,8 @@ async function refresh() {
   if (!token || refreshing) return;
   refreshing = true;
   try {
-    const data = await request('/v1/gif/jobs');
+    const [data, session] = await Promise.all([request('/v1/gif/jobs'), request('/session')]);
+    showSession(session);
     const snapshot = JSON.stringify(data.jobs);
     if (snapshot !== lastSnapshot) {
       lastSnapshot = snapshot;
@@ -181,21 +153,31 @@ $('#login-form').addEventListener('submit', async (event) => {
 });
 $('#disconnect').addEventListener('click', disconnect);
 $('#refresh').addEventListener('click', () => refresh().catch((error) => notify(error.message)));
-document.querySelectorAll('input[name=backend]').forEach((input) => input.addEventListener('change', updateModeHint));
+$('#account-login').addEventListener('click', async () => {
+  $('#account-login').disabled = true;
+  try { showSession(await request('/session/login', {method:'POST'})); }
+  catch (error) { notify(error.message); }
+  finally { await refresh().catch((error) => notify(error.message)); }
+});
+$('#account-finish').addEventListener('click', async () => {
+  $('#account-finish').disabled = true;
+  try { showSession(await request('/session/finish', {method:'POST'})); }
+  catch (error) { notify(error.message); }
+  finally { $('#account-finish').disabled = false; await refresh().catch((error) => notify(error.message)); }
+});
 $('#create-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   $('#submit-job').disabled = true;
   try {
-    const backend = document.querySelector('input[name=backend]:checked').value;
     await request('/v1/gif/jobs', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({backend, prompt: $('#prompt').value.trim()}),
+      body: JSON.stringify({prompt: $('#prompt').value.trim()}),
     });
     $('#prompt').value = '';
     await refresh();
-    notify(backend === 'web' ? '任务已创建，请打开 ChatGPT 生成后上传 GIF' : '任务已加入生成队列');
+    notify('任务已加入队列');
   } catch (error) { notify(error.message); }
-  finally { $('#submit-job').disabled = false; }
+  finally { await refresh().catch((error) => notify(error.message)); }
 });
 if (token) connect().catch((error) => notify(error.message));
 setInterval(() => refresh().catch((error) => notify(error.message)), 5000);

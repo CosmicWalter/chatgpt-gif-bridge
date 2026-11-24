@@ -1,18 +1,13 @@
-"""Local HTTP queue for native GIF generation and import."""
+"""Local headless browser bridge for ChatGPT GIF generation."""
 
 import argparse
-import base64
 import hmac
 import io
 import json
 import os
-import queue
 import re
 import secrets
-import sys
 import threading
-import urllib.error
-import urllib.request
 from collections import OrderedDict
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -20,16 +15,17 @@ from pathlib import Path
 
 from PIL import Image
 
+from browser_worker import BrowserError, BrowserWorker
+
 CHATGPT = "https://chatgpt.com/"
 JOB_PATH = re.compile(r"/v1/gif/jobs/([0-9a-f]{32})(/result)?")
 MAX_BODY = 32_768
 MAX_GIF = 25 * 1024 * 1024
 MAX_JOBS = 8
 MAX_PENDING = 4
-IMAGE_API = "https://api.openai.com/v1/images/generations"
 
 
-class JobError(Exception):
+class JobError(ValueError):
     """An error safe to return to the caller."""
 
 
@@ -50,75 +46,40 @@ def animated_gif(data):
     return data
 
 
-def generate_with_api(prompt, upstream_key):
-    payload = json.dumps({
-        "model": "gpt-image-2.6-flare", "output_format": "gif",
-        "prompt": prompt, "stream": False, "n": 1,
-    }).encode()
-    request = urllib.request.Request(IMAGE_API, data=payload, headers={
-        "Authorization": "Bearer " + upstream_key, "Content-Type": "application/json",
-    })
-    try:
-        with urllib.request.urlopen(request, timeout=240) as response:
-            limit = (MAX_GIF * 4 // 3) + 64 * 1024
-            raw = response.read(limit + 1)
-            if len(raw) > limit:
-                raise JobError("The Images API response was too large.")
-        encoded = json.loads(raw)["data"][0]["b64_json"]
-        return animated_gif(base64.b64decode(encoded, validate=True))
-    except urllib.error.HTTPError as error:
-        with error:
-            raise JobError(f"The OpenAI Images API returned HTTP {error.code}.") from None
-    except (urllib.error.URLError, TimeoutError):
-        raise JobError("The OpenAI Images API could not be reached or timed out.") from None
-    except (KeyError, IndexError, TypeError, ValueError):
-        raise JobError("The Images API returned an invalid result.") from None
-
-
 @dataclass
 class Job:
     status: str = "queued"
     result: bytes | None = None
     error: str | None = None
     prompt: str | None = None
-    backend: str = "web"
 
 
 class Jobs:
     def __init__(self):
         self.items = OrderedDict()
-        self.pending = queue.Queue()
         self.lock = threading.Lock()
 
-    def submit(self, prompt, backend):
+    def submit(self, prompt):
         with self.lock:
-            if sum(job.status in ("queued", "running", "awaiting_upload") for job in self.items.values()) >= MAX_PENDING:
+            if sum(job.status in ("queued", "running") for job in self.items.values()) >= MAX_PENDING:
                 raise JobError("The queue is full.")
             if len(self.items) >= MAX_JOBS:
                 oldest = next(key for key, job in self.items.items() if job.status in ("completed", "failed"))
                 del self.items[oldest]
             job_id = secrets.token_hex(16)
-            if backend == "web":
-                self.items[job_id] = Job(status="awaiting_upload", prompt=prompt, backend=backend)
-            else:
-                self.items[job_id] = Job(prompt=prompt, backend=backend)
-                self.pending.put((job_id, prompt))
+            self.items[job_id] = Job(prompt=prompt)
             return job_id
 
     def get(self, job_id):
         with self.lock:
             job = self.items.get(job_id)
-            return Job(job.status, job.result, job.error, job.prompt, job.backend) if job else None
+            return Job(job.status, job.result, job.error, job.prompt) if job else None
 
-    def import_gif(self, job_id, data):
+    def update(self, job_id, **fields):
         with self.lock:
-            job = self.items.get(job_id)
-            if job is None:
-                return 404
-            if job.status != "awaiting_upload":
-                return 409
-            self.items[job_id] = Job(status="completed", result=data, prompt=job.prompt, backend=job.backend)
-            return 200
+            job = self.items[job_id]
+            for field, value in fields.items():
+                setattr(job, field, value)
 
     def cancel(self, job_id):
         with self.lock:
@@ -132,30 +93,10 @@ class Jobs:
 
     def list(self):
         with self.lock:
-            return [{"id": key, "status": job.status, "prompt": job.prompt, "backend": job.backend, "error": job.error} for key, job in reversed(self.items.items())]
-
-    def run(self, generate):
-        while True:
-            item = self.pending.get()
-            if item is None:
-                return
-            job_id, prompt = item
-            with self.lock:
-                self.items[job_id].status = "running"
-            try:
-                result = Job(status="completed", result=generate(prompt))
-            except JobError as error:
-                result = Job(status="failed", error=str(error))
-            except Exception as error:
-                print(f"Images API operation failed ({type(error).__name__}).", file=sys.stderr)
-                result = Job(status="failed", error="The Images API operation failed.")
-            with self.lock:
-                result.prompt = prompt
-                result.backend = "api"
-                self.items[job_id] = result
+            return [{"id": key, "status": job.status, "prompt": job.prompt, "error": job.error} for key, job in reversed(self.items.items())]
 
 
-def http_handler(jobs, token, api_enabled=False):
+def http_handler(jobs, token, browser):
     expected = ("Bearer " + token).encode()
 
     class Handler(BaseHTTPRequestHandler):
@@ -191,6 +132,15 @@ def http_handler(jobs, token, api_enabled=False):
         def do_POST(self):
             if not self.authorized():
                 return
+            if self.path in ("/session/login", "/session/finish"):
+                try:
+                    if self.path.endswith("/login"):
+                        browser.login()
+                    else:
+                        browser.finish_login()
+                except BrowserError as error:
+                    return self.reply_json(409, error=str(error))
+                return self.reply_json(202, **browser.snapshot())
             if self.path != "/v1/gif/jobs":
                 return self.reply_json(404, error="Unknown endpoint.")
             if self.headers.get_content_type() != "application/json":
@@ -210,49 +160,15 @@ def http_handler(jobs, token, api_enabled=False):
             prompt = data.get("prompt") if isinstance(data, dict) else None
             if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 8_000:
                 return self.reply_json(400, error="Provide a prompt of 1 to 8000 characters.")
-            backend = data.get("backend", "web")
-            if backend not in ("web", "api"):
-                return self.reply_json(400, error="Backend must be web or api.")
-            if backend == "api" and not api_enabled:
-                return self.reply_json(503, error="Set OPENAI_API_KEY to enable the API backend.")
+            if "backend" in data:
+                return self.reply_json(400, error="仅支持 ChatGPT 无头浏览器生成，请移除 backend 参数。")
             try:
-                job_id = jobs.submit(prompt.strip(), backend)
+                job_id = browser.submit(prompt.strip())
+            except BrowserError as error:
+                return self.reply_json(409, error=str(error))
             except JobError as error:
                 return self.reply_json(429, error=str(error))
-            self.reply_json(202, id=job_id, status="awaiting_upload" if backend == "web" else "queued")
-
-        def do_PUT(self):
-            if not self.authorized():
-                return
-            match = JOB_PATH.fullmatch(self.path)
-            if not match or not match[2]:
-                return self.reply_json(404, error="Unknown endpoint.")
-            job = jobs.get(match[1])
-            if job is None:
-                return self.reply_json(404, error="Job not found.")
-            if job.status != "awaiting_upload":
-                return self.reply_json(409, error="The job is not awaiting a web GIF.")
-            if self.headers.get_content_type() != "image/gif":
-                return self.reply_json(415, error="Use image/gif.")
-            try:
-                length = int(self.headers.get("Content-Length", "0"))
-            except ValueError:
-                return self.reply_json(400, error="Invalid Content-Length.")
-            if length > MAX_GIF:
-                return self.reply_json(413, error="The upload is too large.")
-            if length <= 0:
-                return self.reply_json(400, error="A GIF body is required.")
-            data = self.rfile.read(length)
-            if len(data) != length:
-                return self.reply_json(400, error="The upload was incomplete.")
-            try:
-                result = animated_gif(data)
-            except JobError as error:
-                return self.reply_json(422, error=str(error))
-            status = jobs.import_gif(match[1], result)
-            if status != 200:
-                return self.reply_json(status, error="The job is no longer awaiting a GIF.")
-            self.reply_json(200, id=match[1], status="completed")
+            self.reply_json(202, id=job_id, status="queued")
 
         def do_DELETE(self):
             if not self.authorized():
@@ -274,7 +190,9 @@ def http_handler(jobs, token, api_enabled=False):
             if not self.authorized():
                 return
             if self.path == "/health":
-                return self.reply_json(200, status="ok", api_enabled=api_enabled, web_mode="manual")
+                return self.reply_json(200, status="ok", mode="headless")
+            if self.path == "/session":
+                return self.reply_json(200, **browser.snapshot())
             if self.path == "/v1/gif/jobs":
                 return self.reply_json(200, jobs=jobs.list())
             match = JOB_PATH.fullmatch(self.path)
@@ -285,7 +203,7 @@ def http_handler(jobs, token, api_enabled=False):
                 if job.result is None:
                     return self.reply_json(409, status=job.status, error=job.error or "Result is not ready.")
                 return self.reply(200, job.result, "image/gif")
-            fields = {"id": match[1], "status": job.status, "backend": job.backend}
+            fields = {"id": match[1], "status": job.status}
             if job.prompt:
                 fields.update(chatgpt_url=CHATGPT, prompt=job.prompt)
             if job.error:
@@ -314,19 +232,17 @@ def main():
     if not re.fullmatch("[0-9a-f]{64}", token):
         raise SystemExit("Invalid local API token file.")
 
-    upstream_key = os.environ.get("OPENAI_API_KEY", "")
     jobs = Jobs()
-    with ThreadingHTTPServer(("127.0.0.1", args.port), http_handler(jobs, token, bool(upstream_key))) as server:
-        if upstream_key:
-            worker = threading.Thread(
-                target=jobs.run, args=(lambda prompt: generate_with_api(prompt, upstream_key),), daemon=True,
-            )
-            worker.start()
+    browser = BrowserWorker(args.state / "browser", jobs, animated_gif)
+    with ThreadingHTTPServer(("127.0.0.1", args.port), http_handler(jobs, token, browser)) as server:
+        browser.thread.start()
         print(f"Listening on http://127.0.0.1:{server.server_port}", flush=True)
         try:
             server.serve_forever()
         except KeyboardInterrupt:
             pass
+        finally:
+            browser.close()
 
 
 if __name__ == "__main__":

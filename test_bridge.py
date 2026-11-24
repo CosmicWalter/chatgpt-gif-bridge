@@ -1,17 +1,21 @@
-import base64
 import io
 import json
+import tempfile
 import threading
 import time
 import unittest
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from http.server import ThreadingHTTPServer
+from pathlib import Path
 from unittest.mock import patch
 
 from PIL import Image
+from playwright.sync_api import sync_playwright
 
-from bridge import IMAGE_API, Jobs, generate_with_api, http_handler
+from bridge import JobError, Jobs, animated_gif, http_handler
+from browser_worker import BrowserWorker, ChatGPTBrowser
 
 
 def fixture_image(animated=True):
@@ -25,85 +29,144 @@ def fixture_image(animated=True):
 
 
 class BridgeTest(unittest.TestCase):
-    def setUp(self):
-        self.jobs = Jobs()
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), http_handler(self.jobs, "test-token", True))
-        self.listener = threading.Thread(target=self.server.serve_forever)
-        self.listener.start()
-        self.addCleanup(self.server.server_close)
-        self.addCleanup(self.listener.join)
-        self.addCleanup(self.server.shutdown)
-
-    def request(self, path, data=None, method=None, media="application/json", auth=True):
-        headers = {"Content-Type": media}
-        if auth:
-            headers["Authorization"] = "Bearer test-token"
-        url = f"http://127.0.0.1:{self.server.server_port}{path}"
-        return urllib.request.urlopen(
-            urllib.request.Request(url, headers=headers, data=data, method=method), timeout=5,
-        )
-
-    def job(self, backend):
-        with self.request("/v1/gif/jobs", json.dumps({"prompt": "Test motion", "backend": backend}).encode()) as response:
-            self.assertEqual(response.status, 202)
-            return "/v1/gif/jobs/" + json.load(response)["id"]
-
-    def test_web_job_returns_original_animation_and_rejects_still_image(self):
-        with self.assertRaises(urllib.error.HTTPError) as denied:
-            self.request("/health", auth=False)
-        self.assertEqual(denied.exception.code, 401)
-        denied.exception.close()
-        path = self.job("web")
-        with self.request(path) as response:
-            job = json.load(response)
-        self.assertEqual(job["status"], "awaiting_upload")
-        self.assertEqual(job["prompt"], "Test motion")
-        with self.assertRaises(urllib.error.HTTPError) as rejected:
-            self.request(path + "/result", fixture_image(False), method="PUT", media="image/gif")
-        self.assertEqual(rejected.exception.code, 422)
-        rejected.exception.close()
+    def test_headless_job_and_interactive_login(self):
         animation = fixture_image()
-        with self.request(path + "/result", animation, method="PUT", media="image/gif") as uploaded:
-            self.assertEqual(json.load(uploaded)["status"], "completed")
-        with self.request(path + "/result") as response:
-            self.assertEqual(response.headers.get_content_type(), "image/gif")
-            self.assertEqual(response.read(), animation)
+        logged_in = threading.Event()
+        launched = []
 
-    def test_dashboard_assets_and_job_management(self):
-        with self.request("/", auth=False) as response:
-            self.assertIn("GIF Bridge", response.read().decode())
-            self.assertIn("frame-ancestors 'none'", response.headers["Content-Security-Policy"])
-        with self.request("/app.js", auth=False) as response:
-            self.assertEqual(response.headers.get_content_type(), "text/javascript")
-        path = self.job("web")
-        with self.request("/v1/gif/jobs") as response:
-            jobs = json.load(response)["jobs"]
-        self.assertEqual(jobs[0]["id"], path.rsplit("/", 1)[-1])
-        self.assertEqual(jobs[0]["prompt"], "Test motion")
-        with self.request(path, method="DELETE") as response:
-            self.assertEqual(response.status, 200)
-        with self.request("/v1/gif/jobs") as response:
-            self.assertEqual(json.load(response)["jobs"], [])
+        def route_page(route):
+            path = route.request.url.rsplit("/", 1)[-1]
+            if path in ("animation.gif", "still.png"):
+                data = animation if path.endswith("gif") else fixture_image(False)
+                return route.fulfill(body=data, headers={"Content-Type": "application/octet-stream", "Content-Disposition": "attachment"})
+            login_button = "" if logged_in.is_set() else "<button>Log in</button>"
+            route.fulfill(content_type="text/html", body=login_button + '''
+                <textarea id="prompt-textarea"></textarea>
+                <button data-testid="send-button">Send</button>
+                <article data-message-author-role="assistant" hidden>
+                    <a href="/still.png">Download image</a>
+                    <img alt="Animation" width="40" height="40">
+                </article>
+                <dialog><a href="/animation.gif">Download GIF</a></dialog>
+                <script>
+                    document.querySelector('[data-testid="send-button"]').onclick = () => {
+                        document.querySelector('article').hidden = false;
+                    };
+                    document.querySelector('img').onclick = () => document.querySelector('dialog').showModal();
+                </script>
+            ''')
 
-    def test_api_job_requests_native_gif_and_returns_original_bytes(self):
-        path = self.job("api")
-        animation = fixture_image()
-        response = {"data": [{"b64_json": base64.b64encode(animation).decode()}]}
+        @contextmanager
+        def routed_playwright():
+            with sync_playwright() as playwright:
+                launch = playwright.chromium.launch_persistent_context
 
-        def mock_provider(request, timeout):
-            self.assertEqual(request.full_url, IMAGE_API)
-            self.assertEqual(request.get_header("Authorization"), "Bearer upstream-test")
-            body = json.loads(request.data)
-            self.assertEqual(body["model"], "gpt-image-2.6-flare")
-            self.assertEqual(body["output_format"], "gif")
-            self.assertFalse(body["stream"])
-            return io.BytesIO(json.dumps(response).encode())
+                def routed_launch(*args, **kwargs):
+                    launched.append(kwargs["headless"])
+                    kwargs["headless"] = True
+                    context = launch(*args, **kwargs)
+                    context.route("https://chatgpt.com/**", route_page)
+                    return context
 
-        self.jobs.pending.put(None)
-        with patch("bridge.urllib.request.urlopen", mock_provider):
-            self.jobs.run(lambda prompt: generate_with_api(prompt, "upstream-test"))
-        with self.request(path + "/result") as result:
-            self.assertEqual(result.read(), animation)
+                playwright.chromium.launch_persistent_context = routed_launch
+                yield playwright
+
+        with tempfile.TemporaryDirectory() as directory, patch("browser_worker.sync_playwright", routed_playwright):
+            jobs = Jobs()
+            browser = BrowserWorker(Path(directory) / "browser", jobs, animated_gif)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), http_handler(jobs, "test-token", browser))
+            listener = threading.Thread(target=server.serve_forever)
+            listener.start()
+            browser.thread.start()
+            base = f"http://127.0.0.1:{server.server_port}"
+
+            def request(path, data=None, method=None, auth=True):
+                headers = {"Content-Type": "application/json"}
+                if auth:
+                    headers["Authorization"] = "Bearer test-token"
+                return urllib.request.urlopen(urllib.request.Request(base + path, headers=headers, data=data, method=method), timeout=5)
+
+            def wait_state(status):
+                deadline = time.monotonic() + 20
+                while time.monotonic() < deadline:
+                    if browser.snapshot()["status"] == status:
+                        return
+                    time.sleep(.05)
+                self.fail(f"Expected {status}, got {browser.snapshot()}")
+
+            try:
+                with request("/", auth=False) as response:
+                    self.assertIn("GIF 管理", response.read().decode())
+                with self.assertRaises(urllib.error.HTTPError) as denied:
+                    request("/health", auth=False)
+                self.assertEqual(denied.exception.code, 401)
+                denied.exception.close()
+                wait_state("login_required")
+                with self.assertRaises(urllib.error.HTTPError) as denied:
+                    request("/v1/gif/jobs", b'{"prompt":"Test motion"}')
+                self.assertEqual(denied.exception.code, 409)
+                denied.exception.close()
+                with request("/session/login", method="POST") as response:
+                    self.assertEqual(response.status, 202)
+                wait_state("signing_in")
+                logged_in.set()
+                with request("/session/finish", method="POST") as response:
+                    self.assertEqual(response.status, 202)
+                wait_state("ready")
+                with sync_playwright() as playwright:
+                    dashboard_browser = playwright.chromium.launch(channel="chrome")
+                    try:
+                        page = dashboard_browser.new_page(viewport={"width": 1280, "height": 900})
+                        page.goto(base)
+                        page.locator("#token").fill("test-token")
+                        page.locator('#login-form button').click()
+                        page.get_by_text('已登录', exact=True).wait_for()
+                        page.locator('#prompt').fill('Test motion')
+                        page.locator('#submit-job').click()
+                        page.get_by_text('已完成', exact=True).wait_for(timeout=20_000)
+                        page.locator('.preview').wait_for(state='visible')
+                        with page.expect_download() as pending:
+                            page.get_by_role('button', name='下载 GIF', exact=True).click()
+                        self.assertEqual(Path(pending.value.path()).read_bytes(), animation)
+                        self.assertNotIn('让想法动起来', page.locator('body').inner_text())
+                        self.assertTrue(page.locator('body').evaluate('(el) => el.scrollWidth <= innerWidth'))
+                    finally:
+                        dashboard_browser.close()
+                job_id = jobs.list()[0]['id']
+                path = "/v1/gif/jobs/" + job_id
+                deadline = time.monotonic() + 20
+                while time.monotonic() < deadline and jobs.get(job_id).status not in ("completed", "failed"):
+                    time.sleep(.05)
+                self.assertEqual(jobs.get(job_id).status, "completed", jobs.get(job_id).error)
+                with request(path + "/result") as result:
+                    self.assertEqual(result.headers.get_content_type(), "image/gif")
+                    self.assertEqual(result.read(), animation)
+                with request(path, method="DELETE") as response:
+                    self.assertEqual(response.status, 200)
+                with request("/v1/gif/jobs") as response:
+                    self.assertEqual(json.load(response)["jobs"], [])
+                self.assertEqual(launched, [True, False, True])
+            finally:
+                browser.close()
+                server.shutdown()
+                listener.join()
+                server.server_close()
+
+    def test_static_image_is_rejected(self):
+        with self.assertRaises(JobError):
+            animated_gif(fixture_image(False))
+
+    def test_generation_timeout_does_not_report_success(self):
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(channel="chrome")
+            context = browser.new_context()
+            context.route("https://chatgpt.com/**", lambda route: route.fulfill(content_type="text/html", body='<textarea id="prompt-textarea"></textarea><button data-testid="send-button">Send</button>'))
+            try:
+                from browser_worker import BrowserError
+                with self.assertRaises(BrowserError):
+                    ChatGPTBrowser(context, animated_gif, wait_seconds=.1).generate("Test")
+            finally:
+                browser.close()
 
 
 if __name__ == "__main__":
