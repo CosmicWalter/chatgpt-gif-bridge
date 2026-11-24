@@ -8,6 +8,10 @@ python3 -m venv .venv
 .venv/bin/python bridge.py
 ```
 
+Open [the local dashboard](http://127.0.0.1:18763) and paste the access token from `.state/api-token`. The dashboard provides a Chinese-language interface to create jobs, copy prompts, open ChatGPT, upload a downloaded animation, and preview or download completed GIFs. The official API option becomes available when a Platform key is configured on the server. The local token is held in the browser tab's session storage and cleared on disconnect.
+
+The ChatGPT web workflow requires manual submission and download in your browser. Browser automation can use a visible browser or a headless browser, but neither grants additional model permissions. This project currently provides manual web handoff and the official API backend.
+
 Set `OPENAI_API_KEY` in the service environment to enable the `api` backend. The service uses the official Images API with GPT Image 2.6 Flare. API usage is billed to the key's API project.
 
 ```sh
@@ -37,7 +41,7 @@ curl -fsS "$base/v1/gif/jobs/$job_id/result" \
   -H "Authorization: Bearer $bridge_token" -o animation.gif
 ```
 
-Use `DELETE /v1/gif/jobs/<id>` to cancel a web job awaiting an upload. The service requires the local token, accepts up to four outstanding jobs, and retains up to eight jobs in memory, evicting the oldest completed or failed job first. Restarting clears jobs and results. The local bearer token is stored in the ignored `.state/` directory.
+Use `GET /v1/gif/jobs` to list jobs and `DELETE /v1/gif/jobs/<id>` to remove an awaiting, completed, or failed job. The service requires the local token, accepts up to four outstanding jobs, and retains up to eight jobs in memory, evicting the oldest completed or failed job first. Restarting clears jobs and results. The local bearer token is stored in the ignored `.state/` directory.
 
 Run `.venv/bin/python -m unittest -v` to exercise HTTP upload and download and mock the upstream Images API.
 

@@ -69,6 +69,22 @@ class BridgeTest(unittest.TestCase):
             self.assertEqual(response.headers.get_content_type(), "image/gif")
             self.assertEqual(response.read(), animation)
 
+    def test_dashboard_assets_and_job_management(self):
+        with self.request("/", auth=False) as response:
+            self.assertIn("GIF Bridge", response.read().decode())
+            self.assertIn("frame-ancestors 'none'", response.headers["Content-Security-Policy"])
+        with self.request("/app.js", auth=False) as response:
+            self.assertEqual(response.headers.get_content_type(), "text/javascript")
+        path = self.job("web")
+        with self.request("/v1/gif/jobs") as response:
+            jobs = json.load(response)["jobs"]
+        self.assertEqual(jobs[0]["id"], path.rsplit("/", 1)[-1])
+        self.assertEqual(jobs[0]["prompt"], "Test motion")
+        with self.request(path, method="DELETE") as response:
+            self.assertEqual(response.status, 200)
+        with self.request("/v1/gif/jobs") as response:
+            self.assertEqual(json.load(response)["jobs"], [])
+
     def test_api_job_requests_native_gif_and_returns_original_bytes(self):
         path = self.job("api")
         animation = fixture_image()

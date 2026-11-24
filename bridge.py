@@ -81,6 +81,7 @@ class Job:
     result: bytes | None = None
     error: str | None = None
     prompt: str | None = None
+    backend: str = "web"
 
 
 class Jobs:
@@ -98,16 +99,16 @@ class Jobs:
                 del self.items[oldest]
             job_id = secrets.token_hex(16)
             if backend == "web":
-                self.items[job_id] = Job(status="awaiting_upload", prompt=prompt)
+                self.items[job_id] = Job(status="awaiting_upload", prompt=prompt, backend=backend)
             else:
-                self.items[job_id] = Job()
+                self.items[job_id] = Job(prompt=prompt, backend=backend)
                 self.pending.put((job_id, prompt))
             return job_id
 
     def get(self, job_id):
         with self.lock:
             job = self.items.get(job_id)
-            return Job(job.status, job.result, job.error, job.prompt) if job else None
+            return Job(job.status, job.result, job.error, job.prompt, job.backend) if job else None
 
     def import_gif(self, job_id, data):
         with self.lock:
@@ -116,7 +117,7 @@ class Jobs:
                 return 404
             if job.status != "awaiting_upload":
                 return 409
-            self.items[job_id] = Job(status="completed", result=data)
+            self.items[job_id] = Job(status="completed", result=data, prompt=job.prompt, backend=job.backend)
             return 200
 
     def cancel(self, job_id):
@@ -124,10 +125,14 @@ class Jobs:
             job = self.items.get(job_id)
             if job is None:
                 return 404
-            if job.status != "awaiting_upload":
+            if job.status in ("queued", "running"):
                 return 409
             del self.items[job_id]
             return 200
+
+    def list(self):
+        with self.lock:
+            return [{"id": key, "status": job.status, "prompt": job.prompt, "backend": job.backend, "error": job.error} for key, job in reversed(self.items.items())]
 
     def run(self, generate):
         while True:
@@ -145,6 +150,8 @@ class Jobs:
                 print(f"Images API operation failed ({type(error).__name__}).", file=sys.stderr)
                 result = Job(status="failed", error="The Images API operation failed.")
             with self.lock:
+                result.prompt = prompt
+                result.backend = "api"
                 self.items[job_id] = result
 
 
@@ -164,6 +171,9 @@ def http_handler(jobs, token, api_enabled=False):
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob:; connect-src 'self'; frame-ancestors 'none'")
             if content_type == "image/gif":
                 self.send_header("Content-Disposition", 'attachment; filename="animation.gif"')
             self.end_headers()
@@ -252,14 +262,21 @@ def http_handler(jobs, token, api_enabled=False):
                 return self.reply_json(404, error="Unknown endpoint.")
             status = jobs.cancel(match[1])
             if status != 200:
-                return self.reply_json(status, error="No web job awaiting a GIF at this ID.")
+                return self.reply_json(status, error="The job cannot be removed while queued or running.")
             self.reply_json(200, id=match[1], status="cancelled")
 
         def do_GET(self):
+            assets = {"/": ("index.html", "text/html; charset=utf-8"), "/app.js": ("app.js", "text/javascript; charset=utf-8"), "/style.css": ("style.css", "text/css; charset=utf-8")}
+            if self.path in assets:
+                name, content_type = assets[self.path]
+                data = (Path(__file__).resolve().parent / "web" / name).read_bytes()
+                return self.reply(200, data, content_type)
             if not self.authorized():
                 return
             if self.path == "/health":
-                return self.reply_json(200, status="ok")
+                return self.reply_json(200, status="ok", api_enabled=api_enabled, web_mode="manual")
+            if self.path == "/v1/gif/jobs":
+                return self.reply_json(200, jobs=jobs.list())
             match = JOB_PATH.fullmatch(self.path)
             job = jobs.get(match[1]) if match else None
             if job is None:
@@ -268,7 +285,7 @@ def http_handler(jobs, token, api_enabled=False):
                 if job.result is None:
                     return self.reply_json(409, status=job.status, error=job.error or "Result is not ready.")
                 return self.reply(200, job.result, "image/gif")
-            fields = {"id": match[1], "status": job.status}
+            fields = {"id": match[1], "status": job.status, "backend": job.backend}
             if job.prompt:
                 fields.update(chatgpt_url=CHATGPT, prompt=job.prompt)
             if job.error:
