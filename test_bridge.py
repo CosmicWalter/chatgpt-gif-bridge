@@ -156,6 +156,26 @@ class BridgeTest(unittest.TestCase):
         with self.assertRaises(JobError):
             animated_gif(fixture_image(False))
 
+    def test_current_web_composer_and_native_gif_viewer(self):
+        animation = fixture_image()
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(channel="chrome")
+            context = browser.new_context(accept_downloads=True)
+            def route_page(route):
+                if route.request.url.endswith('/animation.gif'):
+                    return route.fulfill(body=animation, headers={'Content-Disposition':'attachment', 'Content-Type':'image/gif'})
+                route.fulfill(content_type='text/html; charset=utf-8', body='''
+                    <div contenteditable="true" role="textbox" aria-label="询问 ChatGPT"></div>
+                    <button aria-label="发送" onclick="document.querySelector('#expand').hidden=false">Send</button>
+                    <button id="expand" aria-label="展开此 GIF" hidden onclick="document.querySelector('#download').hidden=false">Expand</button>
+                    <a id="download" href="/animation.gif" hidden>下载 GIF</a>
+                ''')
+            context.route('https://chatgpt.com/**',route_page)
+            try:
+                self.assertEqual(ChatGPTBrowser(context,animated_gif,wait_seconds=10).generate('Test native GIF'),animation)
+            finally:
+                browser.close()
+
     def test_generation_timeout_does_not_report_success(self):
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(channel="chrome")

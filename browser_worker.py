@@ -13,6 +13,10 @@ from playwright.sync_api import sync_playwright
 CHATGPT = "https://chatgpt.com/"
 DOWNLOAD = re.compile(r"^(download|save)( gif| image| animation)?$|下载|保存", re.I)
 SIGN_IN = re.compile(r"^log in$|^sign in$|^登录$|^登入$", re.I)
+COMPOSER = '#prompt-textarea, [contenteditable="true"][role="textbox"]'
+SEND = re.compile(r"^send( message)?$|^发送$", re.I)
+STOP = re.compile(r"^stop( generating)?$|^停止$", re.I)
+EXPAND_GIF = re.compile(r"展开此 GIF|expand.*GIF|open.*GIF", re.I)
 
 
 class BrowserError(Exception):
@@ -28,8 +32,10 @@ class ChatGPTBrowser:
 
     def signed_in(self, page):
         try:
-            page.locator("#prompt-textarea").wait_for(state="visible", timeout=15_000)
+            page.locator(COMPOSER).first.wait_for(state="visible", timeout=15_000)
         except BrowserTimeout:
+            if page.locator('iframe[src*="challenges.cloudflare.com"], #challenge-running, #cf-challenge-running').count() or re.search(r"just a moment|请稍候|稍等片刻", page.title(), re.I):
+                raise BrowserError("ChatGPT 被 Cloudflare 真人验证拦截，请在登录窗口完成验证后重试。")
             return False
         if not page.url.startswith(CHATGPT):
             return False
@@ -44,12 +50,12 @@ class ChatGPTBrowser:
             page.goto(CHATGPT, wait_until="domcontentloaded", timeout=30_000)
             if not self.signed_in(page):
                 raise BrowserError("ChatGPT 登录已失效或页面不可用，请重新登录。")
-            page.locator("#prompt-textarea").fill(
+            page.locator(COMPOSER).first.fill(
                 "Generate a native animated GIF with a downloadable GIF file. "
                 "Use the built-in animation/image generation feature. "
                 "Do not write code or assemble still frames. Request: " + prompt
             )
-            page.get_by_test_id("send-button").click(timeout=15_000)
+            page.get_by_test_id("send-button").or_(page.get_by_role("button", name=SEND)).first.click(timeout=15_000)
             return self.wait_for_gif(page)
         finally:
             page.close()
@@ -61,7 +67,17 @@ class ChatGPTBrowser:
             if self.stopped.is_set():
                 raise BrowserError("服务已停止。")
             turns = page.locator('[data-message-author-role="assistant"]')
-            if turns.count() and not page.get_by_test_id("stop-button").is_visible():
+            stopping = page.get_by_test_id("stop-button").or_(page.get_by_role("button", name=STOP))
+            if not stopping.first.is_visible():
+                expand = page.get_by_role("button", name=EXPAND_GIF).first
+                if expand.is_visible() and "native-viewer" not in tried:
+                    tried.add("native-viewer")
+                    expand.click(timeout=1_500)
+                if "native-viewer" in tried:
+                    result = self.download_from(page, page, "native-viewer", tried)
+                    if result:
+                        return result
+            if turns.count() and not stopping.first.is_visible():
                 turn = turns.last
                 try:
                     turn.hover(timeout=1_500)
@@ -183,8 +199,8 @@ class BrowserWorker:
                 try:
                     context = open_browser(True)
                     check_login()
-                except Exception:
-                    self.set_state("error", "浏览器初始化失败，请检查 Chrome 和网络连接。")
+                except Exception as error:
+                    self.set_state("error", str(error) if isinstance(error, BrowserError) else "浏览器初始化失败，请检查 Chrome 和网络连接。")
 
                 while not self.stopped.is_set():
                     try:
