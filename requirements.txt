@@ -1,4 +1,4 @@
-Pillow>=11,<13
+Pillow>=13.0.0,<14
 playwright>=1.51,<2
 
 bcrypt>=4,<6
