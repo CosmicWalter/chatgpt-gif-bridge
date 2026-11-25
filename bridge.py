@@ -1,4 +1,4 @@
-"""Local headless browser bridge for ChatGPT GIF generation."""
+"""Local visible Chrome browser bridge for ChatGPT GIF generation."""
 
 import argparse
 import hmac
@@ -213,7 +213,7 @@ def http_handler(jobs, token, browser, results=None):
             if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 8_000:
                 return self.reply_json(400, error="Provide a prompt of 1 to 8000 characters.")
             if "backend" in data:
-                return self.reply_json(400, error="仅支持 ChatGPT 无头浏览器生成，请移除 backend 参数。")
+                return self.reply_json(400, error="仅支持 ChatGPT 普通 Chrome生成，请移除 backend 参数。")
             try:
                 job_id = browser.submit(prompt.strip())
             except BrowserError as error:
@@ -285,7 +285,7 @@ def http_handler(jobs, token, browser, results=None):
             if self.path == "/v1/models":
                 return self.reply_json(200, object="list", data=[{"id": MODEL, "object": "model", "created": 0, "owned_by": "local-bridge"}])
             if self.path == "/health":
-                return self.reply_json(200, status="ok", mode="headless")
+                return self.reply_json(200, status="ok", mode="visible_chrome")
             if self.path == "/session":
                 return self.reply_json(200, **browser.snapshot())
             if self.path == "/v1/gif/jobs":

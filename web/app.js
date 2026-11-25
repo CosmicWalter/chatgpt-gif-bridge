@@ -52,7 +52,7 @@ function showSession(session) {
   $('#account-help').textContent = session.error || (session.status === 'signing_in'
     ? '请在窗口中登录 Plus 账号或完成真人验证，再点击“已完成登录 / 验证”。'
     : session.status === 'ready' || session.status === 'busy'
-      ? '登录状态已保存，生成任务使用无头浏览器。'
+      ? '登录状态已保存，生成任务复用同一个 Chrome 会话，可最小化窗口。'
       : '首次使用请打开登录窗口，登录支持 GIF 的 ChatGPT Plus 账号。');
 }
 
@@ -93,7 +93,7 @@ async function renderJobs(jobs) {
   $('#job-count').textContent = jobs.length;
   for (const job of jobs) {
     const card = $('#job-template').content.firstElementChild.cloneNode(true);
-    card.querySelector('.job-mode').textContent = 'ChatGPT · 无头浏览器';
+    card.querySelector('.job-mode').textContent = 'ChatGPT · 普通 Chrome';
     const status = card.querySelector('.status');
     status.textContent = labels[job.status] || job.status;
     status.classList.add(job.status);

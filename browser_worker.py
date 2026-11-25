@@ -183,14 +183,14 @@ class BrowserWorker:
         self.lock = threading.Lock()
         self.state = "starting"
         self.error = None
-        self.headless = True
+        self.headless = False
         self.commands = queue.Queue()
         self.stopped = threading.Event()
         self.thread = threading.Thread(target=self.run, daemon=True)
 
     def snapshot(self):
         with self.lock:
-            return {"status": self.state, "error": self.error, "headless": self.headless, "mode": "headless"}
+            return {"status": self.state, "error": self.error, "headless": self.headless, "mode": "visible_chrome"}
 
     def set_state(self, state, error=None):
         with self.lock:
@@ -225,12 +225,12 @@ class BrowserWorker:
         pending = deque(row["id"] for row in reversed(self.jobs.list()) if row["status"] in ("queued", "running", "waiting_verification"))
         try:
             with sync_playwright() as playwright:
-                def open_browser(headless):
+                def open_browser():
                     result = playwright.chromium.launch_persistent_context(
-                        str(self.profile), channel="chrome", headless=headless, accept_downloads=True,
+                        str(self.profile), channel="chrome", headless=False, accept_downloads=True,
                     )
                     with self.lock:
-                        self.headless = headless
+                        self.headless = False
                     return result
 
                 def check_login():
@@ -248,7 +248,7 @@ class BrowserWorker:
                         self.set_state("error", "浏览器或网络连接失败，请检查 Chrome 和网络后重新打开登录窗口。")
 
                 try:
-                    context = open_browser(True)
+                    context = open_browser()
                     check_login()
                 except Exception as error:
                     record_error(error)
@@ -268,26 +268,28 @@ class BrowserWorker:
                             try:
                                 if command == "finish":
                                     # Check the existing visible page without navigating or restarting it.
-                                    page = next((page for page in context.pages if page.url.startswith(CHATGPT)), None) if context else None
+                                    page = next((page for page in reversed(context.pages) if page.url.startswith(CHATGPT)), None) if context else None
                                     try:
+                                        if page:
+                                            page.wait_for_timeout(200)
                                         if page is None or not ChatGPTBrowser(context, self.validate, self.stopped).signed_in(page):
                                             raise LoginRequired()
                                     except (LoginRequired, VerificationRequired) as error:
                                         self.set_state("signing_in", str(error) + " 当前窗口已保留，请勿反复点击完成。")
                                         continue
-                                if context:
-                                    context.close()
-                                    context = None
-                                context = open_browser(command == "finish")
-                                if command == "login":
-                                    page = context.pages[0] if context.pages else context.new_page()
-                                    # Reopen the interrupted original chat for manual inspection if available.
-                                    interrupted = self.jobs.get(pending[0]) if pending else None
-                                    url = interrupted.chat_url if interrupted and interrupted.chat_url else CHATGPT
-                                    page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-                                    self.set_state("signing_in")
+                                if command == "finish":
+                                    # Keep the authenticated browser process, profile and page unchanged.
+                                    self.set_state("ready")
                                 else:
-                                    check_login()
+                                    if not context or not context.browser or not context.browser.is_connected():
+                                        context = open_browser()
+                                    pages = [page for page in context.pages if page.url.startswith(CHATGPT)]
+                                    # Prefer the most recent interrupted page. Do not reload a challenge.
+                                    page = pages[-1] if pages else context.new_page()
+                                    if not pages:
+                                        page.goto(CHATGPT, wait_until="domcontentloaded", timeout=30_000)
+                                    page.bring_to_front()
+                                    self.set_state("signing_in")
                             except Exception as error:
                                 record_error(error)
                         if not pending or self.snapshot()["status"] != "ready":

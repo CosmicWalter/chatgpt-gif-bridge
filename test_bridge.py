@@ -29,17 +29,19 @@ def fixture_image(animated=True):
 
 
 class BridgeTest(unittest.TestCase):
-    def test_headless_job_and_interactive_login(self):
+    def test_visible_job_and_login_keep_one_browser_session(self):
         animation = fixture_image()
         logged_in = threading.Event()
         launched = []
 
         def route_page(route):
             path = route.request.url.rsplit("/", 1)[-1]
+            if path == "fixture-login":
+                return route.fulfill(json={"ready": logged_in.is_set()})
             if path in ("animation.gif", "still.png"):
                 data = animation if path.endswith("gif") else fixture_image(False)
                 return route.fulfill(body=data, headers={"Content-Type": "application/octet-stream", "Content-Disposition": "attachment"})
-            login_button = "" if logged_in.is_set() else "<button>Log in</button>"
+            login_button = "" if logged_in.is_set() else "<button id='fixture-sign-in'>Log in</button>"
             route.fulfill(content_type="text/html", body=login_button + '''
                 <textarea id="prompt-textarea"></textarea>
                 <button data-testid="send-button">Send</button>
@@ -49,6 +51,10 @@ class BridgeTest(unittest.TestCase):
                 </article>
                 <dialog><a href="/animation.gif">Download GIF</a></dialog>
                 <script>
+                    setInterval(async () => {
+                        const state = await (await fetch('/fixture-login')).json();
+                        if (state.ready) document.querySelector('#fixture-sign-in')?.remove();
+                    }, 50);
                     document.querySelector('[data-testid="send-button"]').onclick = () => {
                         document.querySelector('article').hidden = false;
                     };
@@ -149,7 +155,8 @@ class BridgeTest(unittest.TestCase):
                     self.assertEqual(response.status, 200)
                 with request("/v1/gif/jobs") as response:
                     self.assertEqual(json.load(response)["jobs"], [])
-                self.assertEqual(launched, [True, False, True])
+                self.assertEqual(launched, [False])
+                self.assertFalse(browser.snapshot()['headless'])
             finally:
                 browser.close()
                 server.shutdown()

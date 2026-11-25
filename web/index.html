@@ -3,7 +3,7 @@
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>GIF Bridge</title><link rel="stylesheet" href="/style.css"><script defer src="/app.js"></script></head>
 <body>
 <aside><a class="brand" href="/">◈ <span>GIF Bridge</span></a><p class="eyebrow">工作台</p><nav><a class="selected" href="#create">生成任务</a><a href="#jobs">任务记录</a></nav><div class="aside-bottom"><span id="connection" class="connection">尚未连接</span><button id="disconnect" class="quiet" hidden>断开连接</button><a href="https://github.com/CosmicWalter/chatgpt-gif-bridge" target="_blank" rel="noreferrer">GitHub ↗</a></div></aside>
-<main><header><div><h1>GIF 管理</h1><p>通过 ChatGPT 网页生成原生 GIF</p></div><span class="local-tag">无头浏览器</span></header>
+<main><header><div><h1>GIF 管理</h1><p>通过 ChatGPT 网页生成原生 GIF</p></div><span class="local-tag">普通 Chrome</span></header>
 <section id="login" class="panel login"><h2>连接本地服务</h2><p>粘贴启动目录下 <code>.state/api-token</code> 文件中的访问密钥。</p><form id="login-form"><label for="token">访问密钥</label><div class="input-row"><input id="token" type="password" autocomplete="off" required placeholder="输入本地访问密钥"><button type="submit">连接</button></div></form><p class="note">密钥只保存在当前标签页，断开连接后清除。</p></section>
 <div id="workspace" hidden>
 <section class="panel account"><div class="section-heading"><h2>ChatGPT 账号</h2><span id="account-status" class="status">检查中</span></div><p id="account-help" class="note">请使用支持 GIF 的 Plus 账号。</p><div class="job-actions"><button id="account-login" type="button" class="secondary">打开登录 / 验证窗口</button><button id="account-finish" type="button" hidden>已完成登录 / 验证</button></div></section>
