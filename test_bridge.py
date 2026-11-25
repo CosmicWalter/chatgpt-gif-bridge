@@ -106,10 +106,10 @@ class BridgeTest(unittest.TestCase):
                     request("/v1/gif/jobs", b'{"prompt":"Test motion"}')
                 self.assertEqual(denied.exception.code, 409)
                 denied.exception.close()
+                logged_in.set()
                 with request("/session/login", method="POST") as response:
                     self.assertEqual(response.status, 202)
                 wait_state("signing_in")
-                logged_in.set()
                 with request("/session/finish", method="POST") as response:
                     self.assertEqual(response.status, 202)
                 wait_state("ready")

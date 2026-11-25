@@ -75,8 +75,15 @@ class RecoveryTests(unittest.TestCase):
                 worker.login()
                 self.wait(lambda: worker.snapshot()['status']=='signing_in', 'Login window not opened')
                 self.assertFalse(worker.snapshot()['headless'])
-                challenge.clear()  # Simulates the human completing verification.
                 worker.finish_login()
+                self.wait(lambda: worker.snapshot()['status']=='signing_in', 'Unfinished verification window was not preserved')
+                self.assertEqual(launches, [True, False])
+                self.assertIn('当前窗口已保留', worker.snapshot()['error'])
+                challenge.clear()  # Simulates the human completing verification.
+                # Reopening the service after verification also resumes the saved task.
+                worker.close()
+                worker = BrowserWorker(Path(directory) / 'browser', jobs, animated_gif)
+                worker.thread.start()
                 self.wait(lambda: jobs.get(job_id).status=='completed', 'Original job did not resume')
                 self.assertTrue(worker.snapshot()['headless'])
                 self.assertEqual(sends, ['submitted'])

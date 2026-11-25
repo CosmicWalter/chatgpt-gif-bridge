@@ -266,6 +266,15 @@ class BrowserWorker:
                             pending.append(job_id)
                         if command in ("login", "finish"):
                             try:
+                                if command == "finish":
+                                    # Check the existing visible page without navigating or restarting it.
+                                    page = next((page for page in context.pages if page.url.startswith(CHATGPT)), None) if context else None
+                                    try:
+                                        if page is None or not ChatGPTBrowser(context, self.validate, self.stopped).signed_in(page):
+                                            raise LoginRequired()
+                                    except (LoginRequired, VerificationRequired) as error:
+                                        self.set_state("signing_in", str(error) + " 当前窗口已保留，请勿反复点击完成。")
+                                        continue
                                 if context:
                                     context.close()
                                     context = None
