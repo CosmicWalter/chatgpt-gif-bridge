@@ -10,6 +10,7 @@ from contextlib import contextmanager
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
+from types import SimpleNamespace
 
 from PIL import Image
 from playwright.sync_api import sync_playwright
@@ -80,7 +81,7 @@ class BridgeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, patch("browser_worker.sync_playwright", routed_playwright), patch("browser_worker.launch_visible_chrome", lambda pw, profile: pw.chromium.launch_persistent_context(str(profile), channel="chrome", headless=False, accept_downloads=True)):
             jobs = Jobs()
             browser = BrowserWorker(Path(directory) / "browser", jobs, animated_gif)
-            server = ThreadingHTTPServer(("127.0.0.1", 0), http_handler(jobs, "test-token", browser))
+            server = ThreadingHTTPServer(("127.0.0.1", 0), http_handler(jobs, "test-token", browser, credentials=SimpleNamespace(is_management=lambda key: key == "test-token", is_api=lambda key: key == "test-api-key", keys=lambda: ["test-api-key"])))
             listener = threading.Thread(target=server.serve_forever)
             listener.start()
             browser.thread.start()
@@ -102,7 +103,7 @@ class BridgeTest(unittest.TestCase):
 
             try:
                 with request("/", auth=False) as response:
-                    self.assertIn("GIF 管理", response.read().decode())
+                    self.assertIn("管理中心", response.read().decode())
                 with self.assertRaises(urllib.error.HTTPError) as denied:
                     request("/health", auth=False)
                 self.assertEqual(denied.exception.code, 401)
@@ -125,12 +126,12 @@ class BridgeTest(unittest.TestCase):
                         page = dashboard_browser.new_page(viewport={"width": 1280, "height": 900})
                         page.goto(base)
                         page.locator("#token").fill("test-token")
-                        page.locator('#login-form button').click()
-                        page.locator('#account-status').get_by_text('已连接', exact=True).wait_for()
+                        page.locator('#login-form button[type=submit]').click()
+                        page.locator('#dashboard-status').get_by_text('已连接', exact=True).wait_for()
                         self.assertEqual(page.locator('#api-base').input_value(), base + '/v1')
                         self.assertEqual(page.locator('#api-model').input_value(), 'chatgpt-native-gif')
-                        self.assertEqual(page.locator('#api-key').input_value(), 'test-token')
-                        self.assertEqual(page.locator('#api-key').get_attribute('type'), 'password')
+                        self.assertEqual(page.locator('#api-key-list input').input_value(), 'test-api-key')
+                        self.assertEqual(page.locator('#api-key-list input').get_attribute('type'), 'password')
                         page.locator('#prompt').fill('Test motion')
                         page.locator('#submit-job').click()
                         page.get_by_text('已完成', exact=True).wait_for(timeout=20_000)

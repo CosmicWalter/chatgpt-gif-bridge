@@ -1,6 +1,10 @@
 const $ = (selector) => document.querySelector(selector);
 const labels = {queued: '排队中', running: '生成中', completed: '已完成', failed: '失败', waiting_verification: '等待登录 / 验证'};
-let token = sessionStorage.getItem('bridge-token') || '';
+let token = sessionStorage.getItem('bridge-management-key') || localStorage.getItem('bridge-management-key') || '';
+let apiKeys = [];
+let editedKey = null;
+let deletedKey = null;
+const keyPath = '/v8/management/config/access/api-keys';
 let lastSnapshot = '';
 let previewUrls = [];
 let refreshing = false;
@@ -21,7 +25,7 @@ async function request(path, options = {}, asBlob = false) {
   if (!response.ok) {
     const data = await response.json().catch(() => ({}));
     if (response.status === 401) disconnect();
-    throw new Error(data.error || `请求失败（${response.status}）`);
+    throw new Error(data.error?.message || data.error || `请求失败（${response.status}）`);
   }
   return asBlob ? response.blob() : response.json();
 }
@@ -29,8 +33,19 @@ async function request(path, options = {}, asBlob = false) {
 function disconnect() {
   generation++;
   token = '';
-  sessionStorage.removeItem('bridge-token');
-  $('#api-key').value = '';
+  sessionStorage.removeItem('bridge-management-key');
+  localStorage.removeItem('bridge-management-key');
+  apiKeys = [];
+  editedKey = null;
+  deletedKey = null;
+  $('#edit-key-dialog').close();
+  $('#delete-key-dialog').close();
+  $('#edit-api-key').value = '';
+  $('#new-api-key').value = '';
+  $('#management-key-form').reset();
+  $('#api-key-list').replaceChildren();
+  $('#sidebar').hidden = true;
+  document.body.classList.add('signed-out');
   $('#workspace').hidden = true;
   $('#login').hidden = false;
   $('#disconnect').hidden = true;
@@ -45,6 +60,7 @@ function disconnect() {
 function showSession(session) {
   const names = {verification_required:'需要真人验证', starting:'启动中', ready:'已连接', busy:'生成中', login_required:'未登录', opening_login:'打开登录窗口', signing_in:'等待登录', checking:'验证登录', error:'连接异常'};
   $('#account-status').textContent = names[session.status] || session.status;
+  $('#dashboard-status').textContent = names[session.status] || session.status;
   $('#account-status').className = 'status ' + (session.status === 'ready' ? 'completed' : '');
   $('#account-login').disabled = !['ready', 'verification_required', 'login_required', 'error'].includes(session.status);
   $('#account-finish').hidden = session.status !== 'signing_in';
@@ -57,17 +73,21 @@ function showSession(session) {
 }
 
 async function connect() {
-  const health = await request('/health');
-  sessionStorage.setItem('bridge-token', token);
+  await request('/v8/management/status');
+  sessionStorage.setItem('bridge-management-key', token);
+  if ($('#remember-key').checked) localStorage.setItem('bridge-management-key', token);
+  else localStorage.removeItem('bridge-management-key');
+  $('#sidebar').hidden = false;
+  document.body.classList.remove('signed-out');
   $('#api-base').value = location.origin + '/v1';
-  $('#api-key').value = token;
   $('#login').hidden = true;
   $('#workspace').hidden = false;
   $('#disconnect').hidden = false;
   $('#connection').textContent = '服务已连接';
   $('#connection').className = 'connection online';
   lastSnapshot = '';
-  await refresh();
+  await Promise.all([refresh(), loadKeys()]);
+  showPage();
 }
 
 function addButton(container, text, action, secondary = true) {
@@ -150,15 +170,15 @@ async function refresh() {
 
 $('#login-form').addEventListener('submit', async (event) => {
   event.preventDefault();
+  const submit = $('#login-form button[type=submit]');
+  submit.disabled = true;
+  $('#login-error').textContent = '';
   token = $('#token').value.trim();
   try { await connect(); $('#token').value = ''; }
-  catch (error) { notify(error.message); }
+  catch (error) { $('#login-error').textContent = error.message; }
+  finally { submit.disabled = false; }
 });
 $('#disconnect').addEventListener('click', disconnect);
-$('#copy-api-key').addEventListener('click', async () => {
-  try { await navigator.clipboard.writeText(token); notify('API key 已复制'); }
-  catch { notify('复制失败，请手动选择密钥复制'); }
-});
 $('#refresh').addEventListener('click', () => refresh().catch((error) => notify(error.message)));
 $('#account-login').addEventListener('click', async () => {
   $('#account-login').disabled = true;
@@ -181,10 +201,101 @@ $('#create-form').addEventListener('submit', async (event) => {
       body: JSON.stringify({prompt: $('#prompt').value.trim()}),
     });
     $('#prompt').value = '';
+    location.hash = 'jobs';
+    showPage();
     await refresh();
     notify('任务已加入队列');
   } catch (error) { notify(error.message); }
   finally { await refresh().catch((error) => notify(error.message)); }
 });
-if (token) connect().catch((error) => notify(error.message));
+$('#login-address').value = location.origin;
+$('#remember-key').checked = Boolean(localStorage.getItem('bridge-management-key'));
+if (token) connect().catch((error) => { $('#login-error').textContent = error.message; });
 setInterval(() => refresh().catch((error) => notify(error.message)), 5000);
+
+
+function showPage() {
+  const titles = {dashboard:'仪表盘', keys:'API 密钥', account:'账号认证', jobs:'任务记录', system:'系统设置'};
+  const requested = location.hash.slice(1);
+  const page = Object.hasOwn(titles, requested) ? requested : 'dashboard';
+  document.querySelectorAll('[data-view]').forEach((el) => { el.hidden = el.dataset.view !== page; });
+  document.querySelectorAll('[data-page]').forEach((el) => el.classList.toggle('selected', el.dataset.page === page));
+  $('#page-title').textContent = titles[page];
+  $('#page-breadcrumb').textContent = titles[page];
+}
+window.addEventListener('hashchange', showPage);
+showPage();
+
+async function loadKeys() {
+  const data = await request(keyPath);
+  apiKeys = data['api-keys'];
+  $('#key-count').textContent = apiKeys.length;
+  $('#keys-empty').hidden = apiKeys.length !== 0;
+  $('#api-key-list').replaceChildren();
+  apiKeys.forEach((key, index) => {
+    const row = document.createElement('div');
+    row.className = 'key-row';
+    const number = document.createElement('span');
+    number.className = 'key-number';
+    number.textContent = String(index + 1).padStart(2, '0');
+    const input = document.createElement('input');
+    input.type = 'password';
+    input.readOnly = true;
+    input.value = key;
+    input.setAttribute('aria-label', 'API key ' + (index + 1));
+    row.append(number, input);
+    const reveal = addButton(row, '显示', () => {
+      input.type = input.type === 'password' ? 'text' : 'password';
+      reveal.textContent = input.type === 'password' ? '显示' : '隐藏';
+    });
+    addButton(row, '复制', async () => { await navigator.clipboard.writeText(key); notify('API key 已复制'); });
+    addButton(row, '编辑', () => { editedKey = key; $('#edit-api-key').value = key; $('#edit-key-dialog').showModal(); });
+    const remove = addButton(row, '删除', () => { deletedKey = key; $('#delete-key-dialog').showModal(); });
+    remove.classList.add('danger');
+    $('#api-key-list').append(row);
+  });
+}
+async function mutateKey(method, body) {
+  await request(keyPath, {method, headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+  await loadKeys();
+}
+$('#generate-api-key').addEventListener('click', async () => {
+  const button = $('#generate-api-key');
+  button.disabled = true;
+  try { await mutateKey('POST', {}); notify('API key 已生成'); }
+  catch (error) { notify(error.message); }
+  finally { button.disabled = false; }
+});
+$('#add-key-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  try { await mutateKey('POST', {key:$('#new-api-key').value.trim()}); $('#new-api-key').value = ''; notify('API key 已添加'); }
+  catch (error) { notify(error.message); }
+});
+$('#edit-key-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  try { await mutateKey('PATCH', {old:editedKey, new:$('#edit-api-key').value.trim()}); $('#edit-key-dialog').close(); $('#edit-api-key').value = ''; editedKey = null; notify('API key 已更新'); }
+  catch (error) { notify(error.message); }
+});
+$('#cancel-edit-key').addEventListener('click', () => { $('#edit-key-dialog').close(); $('#edit-api-key').value = ''; editedKey = null; });
+$('#cancel-delete-key').addEventListener('click', () => { $('#delete-key-dialog').close(); deletedKey = null; });
+$('#confirm-delete-key').addEventListener('click', async () => {
+  try { await mutateKey('DELETE', {key:deletedKey}); $('#delete-key-dialog').close(); deletedKey = null; notify('API key 已删除'); }
+  catch (error) { notify(error.message); }
+});
+$('#toggle-login-key').addEventListener('click', () => {
+  const visible = $('#token').type === 'password';
+  $('#token').type = visible ? 'text' : 'password';
+  $('#toggle-login-key').textContent = visible ? '隐藏' : '显示';
+  $('#toggle-login-key').setAttribute('aria-label', visible ? '隐藏管理密钥' : '显示管理密钥');
+});
+$('#management-key-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const next = $('#new-management-key').value;
+  if (next !== $('#confirm-management-key').value) { notify('两次输入的新管理密钥不一致'); return; }
+  try {
+    await request('/v8/management/management-key', {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify({current_key:$('#current-management-key').value, new_key:next})});
+    $('#management-key-form').reset();
+    disconnect();
+    notify('管理密钥已修改，请使用新密钥登录');
+  } catch (error) { notify(error.message); }
+});

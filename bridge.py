@@ -19,6 +19,7 @@ from PIL import Image
 from browser_worker import BrowserError, BrowserWorker
 from openai_compat import APIError, MODEL, generate, validate_request
 from result_store import ResultStore
+from credentials import Credentials
 from urllib.parse import urlsplit, parse_qs
 
 CHATGPT = "https://chatgpt.com/"
@@ -143,7 +144,7 @@ class Jobs:
             return [{"id": key, "status": job.status, "prompt": job.prompt, "error": job.error} for key, job in reversed(self.items.items())]
 
 
-def http_handler(jobs, token, browser, results=None):
+def http_handler(jobs, token, browser, results=None, credentials=None):
     expected = ("Bearer " + token).encode()
 
     class Handler(BaseHTTPRequestHandler):
@@ -171,17 +172,83 @@ def http_handler(jobs, token, browser, results=None):
             self.reply(http_status, json.dumps(data).encode(), "application/json")
 
         def authorized(self):
-            if hmac.compare_digest(self.headers.get("Authorization", "").encode(), expected):
+            authorization = self.headers.get("Authorization", "")
+            provided = authorization[7:] if authorization.lower().startswith("bearer ") else ""
+            management = self.path.startswith('/v8/management/') or self.path in ('/session', '/session/login', '/session/finish', '/health')
+            if management:
+                provided = provided or self.headers.get('X-Management-Key', '')
+            if credentials:
+                if management:
+                    accepted = credentials.is_management(provided)
+                    if not accepted and self.command == 'GET' and self.path in ('/session', '/health'):
+                        accepted = credentials.is_api(provided)
+                else:
+                    accepted = credentials.is_api(provided)
+                    if not accepted and self.path.startswith('/v1/gif/jobs'):
+                        accepted = credentials.is_management(provided)
+            else:
+                accepted = hmac.compare_digest(("Bearer " + provided).encode(), expected)
+            if accepted:
                 return True
             if self.path.startswith(("/v1/images/", "/v1/models")):
-                self.reply_json(401, error={"message": "A valid bearer token is required.", "type": "authentication_error", "code": "invalid_api_key", "param": None})
+                self.reply_json(401, error={"message": "A valid API key is required.", "type": "authentication_error", "code": "invalid_api_key", "param": None})
             else:
-                self.reply_json(401, error="A valid bearer token is required.")
+                self.reply_json(401, error="管理密钥不正确。" if management else "API key 不正确。")
             return False
+
+        def management_body(self):
+            if self.headers.get_content_type() != 'application/json':
+                raise ValueError('请使用 application/json。')
+            length = int(self.headers.get('Content-Length', '0'))
+            if not 0 < length <= MAX_BODY:
+                raise ValueError('请求大小不正确。')
+            data = json.loads(self.rfile.read(length))
+            if not isinstance(data, dict):
+                raise ValueError('请求须为 JSON 对象。')
+            return data
+
+        def manage(self):
+            if not credentials:
+                return self.reply_json(404, error='Management is not configured.')
+            try:
+                path = self.path
+                if path == '/v8/management/config/access/api-keys':
+                    if self.command == 'GET':
+                        return self.reply_json(200, **{'api-keys': credentials.keys()})
+                    data = self.management_body()
+                    if self.command == 'POST':
+                        key = credentials.add(data.get('key'))
+                        return self.reply_json(201, key=key)
+                    if self.command == 'PATCH':
+                        credentials.edit(data.get('old'), data.get('new'))
+                    elif self.command == 'DELETE':
+                        credentials.delete(data.get('key'))
+                    else:
+                        return self.reply_json(405, error='Method not allowed.')
+                    return self.reply_json(200, status='ok')
+                if path == '/v8/management/management-key' and self.command == 'PUT':
+                    data = self.management_body()
+                    credentials.rotate_management(data.get('current_key'), data.get('new_key'))
+                    return self.reply_json(200, status='ok')
+                if path == '/v8/management/status' and self.command == 'GET':
+                    return self.reply_json(200, status='ok', browser=browser.snapshot(), model=MODEL)
+                return self.reply_json(404, error='Unknown management endpoint.')
+            except (ValueError, TypeError, RecursionError):
+                return self.reply_json(400, error='请求不正确；密钥须满足长度要求且不能重复，原 key 必须存在。')
+
+        def do_PATCH(self):
+            if self.authorized():
+                self.manage()
+
+        def do_PUT(self):
+            if self.authorized():
+                self.manage()
 
         def do_POST(self):
             if not self.authorized():
                 return
+            if self.path.startswith('/v8/management/'):
+                return self.manage()
             if self.path in ("/session/login", "/session/finish"):
                 try:
                     if self.path.endswith("/login"):
@@ -253,6 +320,8 @@ def http_handler(jobs, token, browser, results=None):
         def do_DELETE(self):
             if not self.authorized():
                 return
+            if self.path.startswith('/v8/management/'):
+                return self.manage()
             match = JOB_PATH.fullmatch(self.path)
             if not match or match[2]:
                 return self.reply_json(404, error="Unknown endpoint.")
@@ -275,13 +344,15 @@ def http_handler(jobs, token, browser, results=None):
                 if data is None:
                     return self.reply_json(403, error={"message": "Invalid or expired download link.", "type": "invalid_request_error", "code": "invalid_download_link", "param": None})
                 return self.reply(200, data, "image/gif")
-            assets = {"/": ("index.html", "text/html; charset=utf-8"), "/app.js": ("app.js", "text/javascript; charset=utf-8"), "/style.css": ("style.css", "text/css; charset=utf-8")}
+            assets = {"/": ("index.html", "text/html; charset=utf-8"), "/management.html": ("index.html", "text/html; charset=utf-8"), "/app.js": ("app.js", "text/javascript; charset=utf-8"), "/style.css": ("style.css", "text/css; charset=utf-8")}
             if self.path in assets:
                 name, content_type = assets[self.path]
                 data = (Path(__file__).resolve().parent / "web" / name).read_bytes()
                 return self.reply(200, data, content_type)
             if not self.authorized():
                 return
+            if self.path.startswith('/v8/management/'):
+                return self.manage()
             if self.path == "/v1/models":
                 return self.reply_json(200, object="list", data=[{"id": MODEL, "object": "model", "created": 0, "owned_by": "local-bridge"}])
             if self.path == "/health":
@@ -314,6 +385,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state", type=Path, default=Path(__file__).resolve().parent / ".state")
     parser.add_argument("--port", type=int, default=18763)
+    parser.add_argument("--reset-management-key", action="store_true", help="Generate a new management key and exit")
     args = parser.parse_args()
     os.umask(0o077)
     args.state.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -327,10 +399,14 @@ def main():
     if not re.fullmatch("[0-9a-f]{64}", token):
         raise SystemExit("Invalid local API token file.")
 
+    credentials = Credentials(args.state, token, reset_management=args.reset_management_key)
+    if args.reset_management_key:
+        print("Management key reset. Read management-key in the state directory.", flush=True)
+        return
     jobs = Jobs(args.state / "jobs")
     browser = BrowserWorker(args.state / "browser", jobs, animated_gif)
     results = ResultStore(args.state / "downloads", token)
-    with ThreadingHTTPServer(("127.0.0.1", args.port), http_handler(jobs, token, browser, results)) as server:
+    with ThreadingHTTPServer(("127.0.0.1", args.port), http_handler(jobs, token, browser, results, credentials)) as server:
         browser.thread.start()
         print(f"Listening on http://127.0.0.1:{server.server_port}", flush=True)
         try:
