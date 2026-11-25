@@ -1,12 +1,10 @@
 # ChatGPT GIF Bridge
 
-通过 ChatGPT Plus 网页生成 GIF 的本地服务。首次登录打开浏览器窗口，保存登录状态后，任务通过无头 Chrome 自动提交、等待生成并下载文件。
+本地原生 GIF API。使用自己的 ChatGPT Plus 登录，正常生成通过无头 Chrome 完成，不需要浏览器扩展。网页是否开放 GIF 取决于账号权限。
 
-只提供这一种方式，不使用 Platform API key，也不提供手动上传模式。Plus 订阅并不保证账号已开放 GIF；无头浏览器不会解锁账号权限。
+## 安装与登录
 
-## 启动
-
-需要 Python 3.10+ 和 Google Chrome。
+需要 Python 3.10+、Google Chrome 和桌面环境（用于首次登录及真人验证）。
 
 ```sh
 python3 -m venv .venv
@@ -14,37 +12,72 @@ python3 -m venv .venv
 .venv/bin/python bridge.py
 ```
 
-1. 打开 [本地管理页](http://127.0.0.1:18763)，输入 `.state/api-token` 中的访问密钥。
-2. 点击“登录 ChatGPT”，在打开的窗口中登录支持 GIF 的 Plus 账号。
-3. 回到管理页点击“已完成登录”。服务关闭登录窗口，使用相同登录状态启动无头浏览器。
-4. 输入提示词，点击“生成”。完成后可预览和下载 GIF。
+打开 [管理页](http://127.0.0.1:18763)，用 `.state/api-token` 中的密钥连接。点击“打开登录 / 验证窗口”，登录 ChatGPT 或完成真人验证，然后点击“已完成登录 / 验证”。服务保存专用浏览器配置，关闭窗口并切回真正的无头模式。日常 Chrome 的登录不会自动共享。
 
-浏览器配置和登录凭据保存在 `.state/browser`，请勿分享或提交该目录。登录窗口显示在运行服务的电脑上；首次登录需要桌面环境。登录过期后需重新登录。
+不需要安装扩展。浏览器配置、任务、结果和密钥均保存在本机 `.state/` 中，请勿分享该目录。退出并重启服务会保留登录状态及任务。每个人各自部署、登录自己的账号，不需要公网服务。
 
-## 接口
+## API 配置
 
-除静态管理页外，接口均需要 `Authorization: Bearer <本地访问密钥>`。
+- Base URL：`http://127.0.0.1:18763/v1`
+- API key：管理页复制的访问密钥
+- 模型：`chatgpt-native-gif`
+- 接口：`POST /v1/images/generations`
 
-| 请求 | 用途 |
+标准 OpenAI Python SDK 可直接调用：
+
+```python
+import base64
+from pathlib import Path
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://127.0.0.1:18763/v1",
+    api_key="<bridge API key>",
+    timeout=400,
+    max_retries=0,
+)
+result = client.images.generate(
+    model="chatgpt-native-gif",
+    prompt="小纸船在水面轻轻摇晃，原生循环 GIF",
+    n=1,
+    response_format="b64_json",
+)
+Path("animation.gif").write_bytes(base64.b64decode(result.data[0].b64_json))
+```
+
+将 `response_format` 改为 `url`，则从 `result.data[0].url` 取得有效期一小时的本机下载链接。链接可直接下载，不需要再传 API key；该链接只授权访问一个结果。过期文件自动清理，链接在服务重启后仍可用，前提是 key、状态目录和端口没有改变。服务仅监听本机，链接不适用于其他电脑。
+
+这是 OpenAI Images 生成接口的有限兼容实现，不是完整 CPA。支持 `prompt`、`model`、`n=1`、`response_format=b64_json|url`，默认 Base64。`size=auto|WIDTHxHEIGHT` 和 `quality=auto|low|medium|high|standard|hd` 作为要求传入网页，实际尺寸和质量由网页决定。只支持原生 GIF，`output_format` 只能省略或为 `gif`。不支持的模型或参数会明确报错，不提供静态生图、图片编辑或对话接口。
+
+返回下载文件的原始字节，不重新编码、缩放或拼帧。服务会校验文件是可解码的多帧 GIF。
+
+## 验证与任务恢复
+
+CF 验证可能在相同配置及稳定网络下复用一段时间，但无法保证有效时长；切换到无头或更换网络后也可能重新要求验证。遇到验证会暂停任务与接单，管理页显示“需要真人验证”。服务不会自动解验证码，也不会改用有界面浏览器生成。
+
+已经发送的任务记录原聊天地址，恢复时检查原聊天，不重复发送。若发送是否成功无法确认，任务报错并要求检查原聊天。退出时未完成的任务会在重启后恢复；结果不明时不会自动重复提交。
+
+生成接口最多等待 360 秒，建议客户端关闭自动重试，避免重复制图。503 表示浏览器未就绪、需要登录或验证；429 表示队列满；502 表示生成失败；504 表示等待超时。生成失败、等待超时或任务暂停后的响应包含 `error.job_id`，可通过原任务接口检查。
+
+| 接口 | 用途 |
 | --- | --- |
-| `GET /health` | 服务状态 |
-| `GET /session` | 浏览器登录状态 |
-| `POST /session/login` | 打开登录窗口 |
-| `POST /session/finish` | 保存登录并切回无头浏览器 |
-| `POST /v1/gif/jobs` | 提交任务，JSON：`{"prompt":"纸船在水面轻轻摇晃，循环 GIF"}` |
-| `GET /v1/gif/jobs` | 任务列表 |
-| `GET /v1/gif/jobs/<id>` | 单个任务状态 |
-| `GET /v1/gif/jobs/<id>/result` | 下载 GIF |
-| `DELETE /v1/gif/jobs/<id>` | 删除已完成或失败的记录 |
+| `GET /v1/models` | 模型列表 |
+| `GET /session` | 登录、验证和无头状态 |
+| `POST /session/login` | 打开登录 / 验证窗口 |
+| `POST /session/finish` | 切回无头并检查登录 |
+| `POST /v1/gif/jobs` | 异步提交 `{"prompt":"..."}` |
+| `GET /v1/gif/jobs` | 最近任务 |
+| `GET /v1/gif/jobs/<id>` | 原任务状态 |
+| `GET /v1/gif/jobs/<id>/result` | 下载结果 |
+| `DELETE /v1/gif/jobs/<id>` | 删除已结束任务 |
 
-任务依次执行，最多接受 4 个待完成任务，保留 8 条记录。任务和结果保存在内存中，重启后清空。服务仅监听本机。
+除管理页静态资源和签名下载链接外，接口均需 `Authorization: Bearer <API key>`。最多接受四个未完成任务，依次执行，保留最近八条任务。
 
-## 验证范围
-
-服务要求网页生成原生动画，不合成静态帧。下载结果必须是可解码的多帧 GIF，原始文件不会重新编码。但仅凭文件格式无法证明上游使用了哪种生成方式。
-
-自动化测试使用模拟 ChatGPT 页面，覆盖登录状态切换、无头提交、下载、原始字节保留、静态图片拒绝和超时失败。**模拟测试通过不代表真实 Plus 账号已经成功生成 GIF。** 实际可用性取决于账号权限、网络和 ChatGPT 网页结构，需要登录后实测。
+## 检查
 
 ```sh
+.venv/bin/pip install -r requirements-dev.txt
 .venv/bin/python -m unittest -v
 ```
+
+自动测试使用模拟网页和标准 OpenAI SDK。真实无头验收要求：连续生成两次并下载成功，重启后再生成一次；普通 Chrome 生成成功或模拟测试通过不能替代该验收。当前无头流程的实际可用性仍需在目标电脑完成登录 / 验证后确认。

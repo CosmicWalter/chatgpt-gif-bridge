@@ -1,5 +1,5 @@
 const $ = (selector) => document.querySelector(selector);
-const labels = {queued: '排队中', running: '生成中', completed: '已完成', failed: '失败'};
+const labels = {queued: '排队中', running: '生成中', completed: '已完成', failed: '失败', waiting_verification: '等待登录 / 验证'};
 let token = sessionStorage.getItem('bridge-token') || '';
 let lastSnapshot = '';
 let previewUrls = [];
@@ -30,6 +30,7 @@ function disconnect() {
   generation++;
   token = '';
   sessionStorage.removeItem('bridge-token');
+  $('#api-key').value = '';
   $('#workspace').hidden = true;
   $('#login').hidden = false;
   $('#disconnect').hidden = true;
@@ -42,22 +43,24 @@ function disconnect() {
 }
 
 function showSession(session) {
-  const names = {starting:'启动中', ready:'已登录', busy:'生成中', login_required:'未登录', opening_login:'打开登录窗口', signing_in:'等待登录', checking:'验证登录', error:'连接异常'};
+  const names = {verification_required:'需要真人验证', starting:'启动中', ready:'已连接', busy:'生成中', login_required:'未登录', opening_login:'打开登录窗口', signing_in:'等待登录', checking:'验证登录', error:'连接异常'};
   $('#account-status').textContent = names[session.status] || session.status;
   $('#account-status').className = 'status ' + (session.status === 'ready' ? 'completed' : '');
-  $('#account-login').disabled = !['ready', 'login_required', 'error'].includes(session.status);
+  $('#account-login').disabled = !['ready', 'verification_required', 'login_required', 'error'].includes(session.status);
   $('#account-finish').hidden = session.status !== 'signing_in';
   $('#submit-job').disabled = !['ready', 'busy'].includes(session.status);
   $('#account-help').textContent = session.error || (session.status === 'signing_in'
-    ? '请在浏览器窗口中登录 Plus 账号，然后点击“已完成登录”。'
+    ? '请在窗口中登录 Plus 账号或完成真人验证，再点击“已完成登录 / 验证”。'
     : session.status === 'ready' || session.status === 'busy'
-      ? '登录状态已保存，任务通过无头浏览器运行。'
-      : '首次登录会打开浏览器窗口。请使用支持 GIF 的 Plus 账号。');
+      ? '登录状态已保存，生成任务使用无头浏览器。'
+      : '首次使用请打开登录窗口，登录支持 GIF 的 ChatGPT Plus 账号。');
 }
 
 async function connect() {
   const health = await request('/health');
   sessionStorage.setItem('bridge-token', token);
+  $('#api-base').value = location.origin + '/v1';
+  $('#api-key').value = token;
   $('#login').hidden = true;
   $('#workspace').hidden = false;
   $('#disconnect').hidden = false;
@@ -121,7 +124,7 @@ async function renderJobs(jobs) {
         image.hidden = false;
       }).catch((error) => notify(error.message));
     }
-    if (!['queued', 'running'].includes(job.status)) {
+    if (!['queued', 'running', 'waiting_verification'].includes(job.status)) {
       addButton(actions, '移除记录', async () => {
         await request(path, {method: 'DELETE'});
         await refresh();
@@ -152,6 +155,10 @@ $('#login-form').addEventListener('submit', async (event) => {
   catch (error) { notify(error.message); }
 });
 $('#disconnect').addEventListener('click', disconnect);
+$('#copy-api-key').addEventListener('click', async () => {
+  try { await navigator.clipboard.writeText(token); notify('API key 已复制'); }
+  catch { notify('复制失败，请手动选择密钥复制'); }
+});
 $('#refresh').addEventListener('click', () => refresh().catch((error) => notify(error.message)));
 $('#account-login').addEventListener('click', async () => {
   $('#account-login').disabled = true;

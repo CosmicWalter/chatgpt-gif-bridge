@@ -8,14 +8,18 @@ import os
 import re
 import secrets
 import threading
+import time
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from PIL import Image
 
 from browser_worker import BrowserError, BrowserWorker
+from openai_compat import APIError, MODEL, generate, validate_request
+from result_store import ResultStore
+from urllib.parse import urlsplit, parse_qs
 
 CHATGPT = "https://chatgpt.com/"
 JOB_PATH = re.compile(r"/v1/gif/jobs/([0-9a-f]{32})(/result)?")
@@ -52,43 +56,86 @@ class Job:
     result: bytes | None = None
     error: str | None = None
     prompt: str | None = None
+    phase: str = "queued"
+    chat_url: str | None = None
+    created_at: float = field(default_factory=time.time)
 
 
 class Jobs:
-    def __init__(self):
+    def __init__(self, directory=None):
         self.items = OrderedDict()
         self.lock = threading.Lock()
+        self.directory = Path(directory) if directory else None
+        if self.directory:
+            self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            for path in sorted(self.directory.glob('*.json'), key=lambda path: path.stat().st_mtime):
+                if not re.fullmatch(r'[0-9a-f]{32}', path.stem):
+                    continue
+                try:
+                    data = json.loads(path.read_text())
+                    job = Job(**data)
+                    result = path.with_suffix('.gif')
+                    if job.status == 'completed':
+                        job.result = animated_gif(result.read_bytes())
+                    self.items[path.stem] = job
+                except (ValueError, TypeError, OSError):
+                    continue
+            self.items = OrderedDict(sorted(self.items.items(), key=lambda entry: entry[1].created_at))
+
+    def _save(self, job_id):
+        if not self.directory:
+            return
+        job = self.items[job_id]
+        if job.result is not None:
+            result = self.directory / (job_id + '.gif')
+            result.write_bytes(job.result)
+            result.chmod(0o600)
+        data = asdict(job)
+        data['result'] = None
+        path = self.directory / (job_id + '.json')
+        temporary = path.with_suffix('.tmp')
+        temporary.write_text(json.dumps(data))
+        temporary.chmod(0o600)
+        temporary.replace(path)
+
+    def _remove(self, job_id):
+        del self.items[job_id]
+        if self.directory:
+            for suffix in ('.gif', '.json'):
+                (self.directory / (job_id + suffix)).unlink(missing_ok=True)
 
     def submit(self, prompt):
         with self.lock:
-            if sum(job.status in ("queued", "running") for job in self.items.values()) >= MAX_PENDING:
+            if sum(job.status in ("queued", "running", "waiting_verification") for job in self.items.values()) >= MAX_PENDING:
                 raise JobError("The queue is full.")
             if len(self.items) >= MAX_JOBS:
                 oldest = next(key for key, job in self.items.items() if job.status in ("completed", "failed"))
-                del self.items[oldest]
+                self._remove(oldest)
             job_id = secrets.token_hex(16)
             self.items[job_id] = Job(prompt=prompt)
+            self._save(job_id)
             return job_id
 
     def get(self, job_id):
         with self.lock:
             job = self.items.get(job_id)
-            return Job(job.status, job.result, job.error, job.prompt) if job else None
+            return Job(**asdict(job)) if job else None
 
     def update(self, job_id, **fields):
         with self.lock:
             job = self.items[job_id]
             for field, value in fields.items():
                 setattr(job, field, value)
+            self._save(job_id)
 
     def cancel(self, job_id):
         with self.lock:
             job = self.items.get(job_id)
             if job is None:
                 return 404
-            if job.status in ("queued", "running"):
+            if job.status in ("queued", "running", "waiting_verification"):
                 return 409
-            del self.items[job_id]
+            self._remove(job_id)
             return 200
 
     def list(self):
@@ -96,7 +143,7 @@ class Jobs:
             return [{"id": key, "status": job.status, "prompt": job.prompt, "error": job.error} for key, job in reversed(self.items.items())]
 
 
-def http_handler(jobs, token, browser):
+def http_handler(jobs, token, browser, results=None):
     expected = ("Bearer " + token).encode()
 
     class Handler(BaseHTTPRequestHandler):
@@ -126,7 +173,10 @@ def http_handler(jobs, token, browser):
         def authorized(self):
             if hmac.compare_digest(self.headers.get("Authorization", "").encode(), expected):
                 return True
-            self.reply_json(401, error="A valid bearer token is required.")
+            if self.path.startswith(("/v1/images/", "/v1/models")):
+                self.reply_json(401, error={"message": "A valid bearer token is required.", "type": "authentication_error", "code": "invalid_api_key", "param": None})
+            else:
+                self.reply_json(401, error="A valid bearer token is required.")
             return False
 
         def do_POST(self):
@@ -141,6 +191,8 @@ def http_handler(jobs, token, browser):
                 except BrowserError as error:
                     return self.reply_json(409, error=str(error))
                 return self.reply_json(202, **browser.snapshot())
+            if self.path == "/v1/images/generations":
+                return self.create_image()
             if self.path != "/v1/gif/jobs":
                 return self.reply_json(404, error="Unknown endpoint.")
             if self.headers.get_content_type() != "application/json":
@@ -170,6 +222,34 @@ def http_handler(jobs, token, browser):
                 return self.reply_json(429, error=str(error))
             self.reply_json(202, id=job_id, status="queued")
 
+        def create_image(self):
+            try:
+                if self.headers.get_content_type() != "application/json":
+                    raise APIError(415, "Use application/json.", "invalid_content_type")
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                except ValueError:
+                    raise APIError(400, "Invalid Content-Length.", "invalid_request") from None
+                if not 0 < length <= MAX_BODY:
+                    raise APIError(413 if length > MAX_BODY else 400, "Invalid request size.", "invalid_request")
+                try:
+                    data = json.loads(self.rfile.read(length))
+                except (ValueError, RecursionError):
+                    raise APIError(400, "Invalid JSON.", "invalid_json") from None
+                prompt = validate_request(data)
+                try:
+                    result = generate(jobs, browser, prompt,
+                                      response_format=data.get("response_format", "b64_json"),
+                                      results=results,
+                                      base_url=f"http://127.0.0.1:{self.server.server_port}")
+                except BrowserError as error:
+                    raise APIError(503, str(error), getattr(error, "code", "browser_unavailable")) from None
+                except JobError as error:
+                    raise APIError(429, str(error), "queue_full") from None
+                return self.reply_json(200, **result)
+            except APIError as error:
+                return self.reply_json(error.status, error=error.error)
+
         def do_DELETE(self):
             if not self.authorized():
                 return
@@ -182,6 +262,19 @@ def http_handler(jobs, token, browser):
             self.reply_json(200, id=match[1], status="cancelled")
 
         def do_GET(self):
+            parsed = urlsplit(self.path)
+            result_match = re.fullmatch(r'/v1/images/results/([0-9a-f]{32})\.gif', parsed.path)
+            if result_match:
+                query = parse_qs(parsed.query)
+                try:
+                    expires = int(query.get('expires', [''])[0])
+                    signature = query.get('signature', [''])[0]
+                    data = results.read(result_match[1], expires, signature) if results else None
+                except (ValueError, OverflowError):
+                    data = None
+                if data is None:
+                    return self.reply_json(403, error={"message": "Invalid or expired download link.", "type": "invalid_request_error", "code": "invalid_download_link", "param": None})
+                return self.reply(200, data, "image/gif")
             assets = {"/": ("index.html", "text/html; charset=utf-8"), "/app.js": ("app.js", "text/javascript; charset=utf-8"), "/style.css": ("style.css", "text/css; charset=utf-8")}
             if self.path in assets:
                 name, content_type = assets[self.path]
@@ -189,6 +282,8 @@ def http_handler(jobs, token, browser):
                 return self.reply(200, data, content_type)
             if not self.authorized():
                 return
+            if self.path == "/v1/models":
+                return self.reply_json(200, object="list", data=[{"id": MODEL, "object": "model", "created": 0, "owned_by": "local-bridge"}])
             if self.path == "/health":
                 return self.reply_json(200, status="ok", mode="headless")
             if self.path == "/session":
@@ -232,9 +327,10 @@ def main():
     if not re.fullmatch("[0-9a-f]{64}", token):
         raise SystemExit("Invalid local API token file.")
 
-    jobs = Jobs()
+    jobs = Jobs(args.state / "jobs")
     browser = BrowserWorker(args.state / "browser", jobs, animated_gif)
-    with ThreadingHTTPServer(("127.0.0.1", args.port), http_handler(jobs, token, browser)) as server:
+    results = ResultStore(args.state / "downloads", token)
+    with ThreadingHTTPServer(("127.0.0.1", args.port), http_handler(jobs, token, browser, results)) as server:
         browser.thread.start()
         print(f"Listening on http://127.0.0.1:{server.server_port}", flush=True)
         try:
@@ -243,6 +339,7 @@ def main():
             pass
         finally:
             browser.close()
+            results.close()
 
 
 if __name__ == "__main__":
