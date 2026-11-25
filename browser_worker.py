@@ -10,6 +10,7 @@ from tempfile import TemporaryDirectory
 
 from playwright.sync_api import TimeoutError as BrowserTimeout
 from playwright.sync_api import sync_playwright
+from chrome_runtime import launch_visible_chrome, close_visible_chrome
 
 CHATGPT = "https://chatgpt.com/"
 DOWNLOAD = re.compile(r"^(download|save)( gif| image| animation)?$|下载|保存", re.I)
@@ -226,16 +227,16 @@ class BrowserWorker:
         try:
             with sync_playwright() as playwright:
                 def open_browser():
-                    result = playwright.chromium.launch_persistent_context(
-                        str(self.profile), channel="chrome", headless=False, accept_downloads=True,
-                    )
+                    result = launch_visible_chrome(playwright, self.profile)
+                    result.on("close", lambda: self.set_state("error", "Chrome 窗口已关闭，请重新打开登录窗口。") if not self.stopped.is_set() else None)
                     with self.lock:
                         self.headless = False
                     return result
 
                 def check_login():
                     page = context.pages[0] if context.pages else context.new_page()
-                    page.goto(CHATGPT, wait_until="domcontentloaded", timeout=30_000)
+                    if not page.url.startswith(CHATGPT):
+                        page.goto(CHATGPT, wait_until="domcontentloaded", timeout=30_000)
                     if not ChatGPTBrowser(context, self.validate, self.stopped).signed_in(page):
                         raise LoginRequired()
                     self.set_state("ready")
@@ -281,7 +282,7 @@ class BrowserWorker:
                                     # Keep the authenticated browser process, profile and page unchanged.
                                     self.set_state("ready")
                                 else:
-                                    if not context or not context.browser or not context.browser.is_connected():
+                                    if not context or not context.browser or not context.browser.is_connected() or not context.pages:
                                         context = open_browser()
                                     pages = [page for page in context.pages if page.url.startswith(CHATGPT)]
                                     # Prefer the most recent interrupted page. Do not reload a challenge.
@@ -330,7 +331,7 @@ class BrowserWorker:
                                     record_error(error)
                 finally:
                     if context:
-                        context.close()
+                        close_visible_chrome(context)
         except Exception:
             self.set_state("error", "浏览器进程启动失败。")
         finally:

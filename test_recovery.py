@@ -52,7 +52,7 @@ class RecoveryTests(unittest.TestCase):
                     return context
                 playwright.chromium.launch_persistent_context = launch_routed
                 yield playwright
-        with patch('browser_worker.sync_playwright', routed):
+        with patch('browser_worker.sync_playwright', routed), patch('browser_worker.launch_visible_chrome', lambda pw, profile: pw.chromium.launch_persistent_context(str(profile), channel='chrome', headless=False, accept_downloads=True)):
             yield
 
     def test_verification_pauses_then_resumes_without_duplicate_submission(self):
@@ -166,7 +166,7 @@ class RecoveryTests(unittest.TestCase):
                         return context
                     playwright.chromium.launch_persistent_context = launch_offline
                     yield playwright
-            with patch('browser_worker.sync_playwright', disconnected):
+            with patch('browser_worker.sync_playwright', disconnected), patch('browser_worker.launch_visible_chrome', lambda pw, profile: pw.chromium.launch_persistent_context(str(profile), channel='chrome', headless=True, accept_downloads=True)):
                 jobs = Jobs()
                 worker = BrowserWorker(Path(directory) / 'browser', jobs, animated_gif)
                 worker.thread.start()

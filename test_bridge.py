@@ -77,7 +77,7 @@ class BridgeTest(unittest.TestCase):
                 playwright.chromium.launch_persistent_context = routed_launch
                 yield playwright
 
-        with tempfile.TemporaryDirectory() as directory, patch("browser_worker.sync_playwright", routed_playwright):
+        with tempfile.TemporaryDirectory() as directory, patch("browser_worker.sync_playwright", routed_playwright), patch("browser_worker.launch_visible_chrome", lambda pw, profile: pw.chromium.launch_persistent_context(str(profile), channel="chrome", headless=False, accept_downloads=True)):
             jobs = Jobs()
             browser = BrowserWorker(Path(directory) / "browser", jobs, animated_gif)
             server = ThreadingHTTPServer(("127.0.0.1", 0), http_handler(jobs, "test-token", browser))
